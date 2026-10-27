@@ -1,0 +1,42 @@
+{
+  "target_qq": {
+    "description": "需要采集图片 / 表情包的 QQ 号列表（按 QQ 号锁定）",
+    "type": "list",
+    "default": []
+  },
+  "collect_enabled": {
+    "description": "总开关：是否开启采集",
+    "type": "bool",
+    "default": true
+  },
+  "collect_face": {
+    "description": "采集 QQ 系统表情（[微笑] 这类）",
+    "type": "bool",
+    "default": true
+  },
+  "collect_mface": {
+    "description": "采集 QQ 商城表情包 / 动画表情",
+    "type": "bool",
+    "default": true
+  },
+  "only_in_group": {
+    "description": "只采集群聊消息（关闭则群聊 + 私聊都采集）",
+    "type": "bool",
+    "default": false
+  },
+  "max_file_mb": {
+    "description": "单张图片大小上限（MB），超过则跳过",
+    "type": "int",
+    "default": 10
+  },
+  "notify_on_collect": {
+    "description": "每次成功采集后在群里发一条提示",
+    "type": "bool",
+    "default": false
+  },
+  "download_timeout": {
+    "description": "下载表情图片的超时时间（秒）",
+    "type": "int",
+    "default": 15
+  }
+}

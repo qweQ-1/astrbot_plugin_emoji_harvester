@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>表情包图库</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">🖼️</span>
+      <div>
+        <h1>表情包图库</h1>
+        <p class="sub" id="subtitle">加载中…</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button class="btn ghost" id="btn-refresh" title="刷新">↻</button>
+      <button class="btn danger ghost" id="btn-clear" title="清空图库">🗑</button>
+    </div>
+  </header>
+
+  <section class="stats" id="stats"></section>
+
+  <section class="toolbar">
+    <div class="search-wrap">
+      <span class="search-icon">🔍</span>
+      <input type="search" id="keyword" placeholder="搜索文件名 / 发送者 / 哈希…" autocomplete="off">
+      <button class="btn ghost tiny" id="btn-search">搜索</button>
+    </div>
+    <div class="filters">
+      <select id="source" title="来源">
+        <option value="">全部来源</option>
+        <option value="image">图片</option>
+        <option value="face">系统表情</option>
+        <option value="mface">商城表情包</option>
+      </select>
+      <select id="order" title="排序">
+        <option value="new">最新优先</option>
+        <option value="old">最旧优先</option>
+        <option value="big">体积最大</option>
+        <option value="small">体积最小</option>
+      </select>
+      <select id="sender" title="发送者">
+        <option value="">全部发送者</option>
+      </select>
+      <label class="chk"><input type="checkbox" id="animated"> 仅动画</label>
+      <label class="chk"><input type="checkbox" id="static"> 仅静态</label>
+    </div>
+  </section>
+
+  <section class="grid-wrap">
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty" hidden>
+      <div class="empty-icon">📭</div>
+      <p id="empty-text">还没有采集到任何素材</p>
+      <p class="empty-hint">在插件配置里填上要监听的 QQ 号，然后让那个用户发张图片试试。</p>
+    </div>
+    <div class="loading" id="loading" hidden><span class="spin"></span> 加载中…</div>
+  </section>
+
+  <footer class="pager" id="pager" hidden>
+    <button class="btn ghost" id="btn-prev">← 上一页</button>
+    <span id="page-info">第 1 / 1 页</span>
+    <button class="btn ghost" id="btn-next">下一页 →</button>
+  </footer>
+</div>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" id="lb-close">✕</button>
+  <button class="lb-nav lb-prev" id="lb-prev">‹</button>
+  <img id="lb-img" alt="素材预览">
+  <button class="lb-nav lb-next" id="lb-next">›</button>
+  <div class="lb-meta" id="lb-meta"></div>
+</div>
+
+<div class="toast" id="toast" hidden></div>
+
+<script src="app.js"></script>
+</body>
+</html>

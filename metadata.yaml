@@ -1,0 +1,19 @@
+# 插件的唯一识别名，建议使用全小写字母和下划线
+name: astrbot_plugin_emoji_harvester
+
+# 插件的简短描述，必须与 plugin.json 中的 desc 字段完全一致
+desc: 按 QQ 号锁定采集指定用户发表情包与图片，并提供可视化图库界面
+
+# 插件版本号
+version: v1.0.0
+
+# 插件作者
+author: qweQ-1
+
+# 插件的Git仓库地址
+repo: https://github.com/qweQ-1/astrbot_plugin_emoji_harvester
+
+# 插件展示界面（在 AstrBot WebUI 的插件页里打开）
+views:
+  - name: gallery
+    title: 表情包图库
