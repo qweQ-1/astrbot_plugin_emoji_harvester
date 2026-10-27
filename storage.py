@@ -39,6 +39,92 @@ def _now() -> float:
     return time.time()
 
 
+# 语义检索时，命中不同字段的权重（越具体的字段权重越高）
+_SEMANTIC_WEIGHTS = {
+    "emotion": 3.0,
+    "scene": 2.5,
+    "caption": 2.0,
+    "keywords": 2.0,
+    "filename": 0.5,
+}
+
+# 常见的中英文停用词，检索时忽略
+_STOPWORDS = {
+    "的", "了", "是", "在", "我", "你", "他", "她", "它", "们", "和", "与",
+    "一个", "一些", "这个", "那个", "什么", "怎么", "可以", "应该", "需要",
+    "a", "an", "the", "is", "are", "to", "of", "and", "or", "in", "on", "for",
+}
+
+
+def _split_terms(text: str) -> list[str]:
+    """把检索文本切成关键词。
+
+    中文按 2-gram 切（没有分词器也能凑合），英文按空格切。
+    """
+    raw = str(text or "").strip().lower()
+    if not raw:
+        return []
+
+    terms: list[str] = []
+    # 英文 / 数字
+    for word in raw.replace("，", " ").replace("、", " ").split():
+        cleaned = word.strip(".,!?;:\"'()[]{}")
+        if len(cleaned) >= 2 and cleaned not in _STOPWORDS:
+            terms.append(cleaned)
+    # 中文 2-gram
+    for run in _find_cjk_runs(raw):
+        if len(run) == 1:
+            if run not in _STOPWORDS:
+                terms.append(run)
+            continue
+        for index in range(len(run) - 1):
+            bigram = run[index : index + 2]
+            if bigram not in _STOPWORDS:
+                terms.append(bigram)
+    # 去重但保持顺序
+    seen: set[str] = set()
+    unique: list[str] = []
+    for term in terms:
+        if term not in seen:
+            seen.add(term)
+            unique.append(term)
+    return unique
+
+
+def _find_cjk_runs(text: str) -> list[str]:
+    """提取文本里的连续中文片段。"""
+    runs: list[str] = []
+    current: list[str] = []
+    for char in text:
+        if "一" <= char <= "鿿":
+            current.append(char)
+        elif current:
+            runs.append("".join(current))
+            current = []
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
+def _semantic_score(asset: "Asset", terms: list[str]) -> float:
+    """给一张图按检索词打分。"""
+    fields = {
+        "emotion": (asset.emotion or "").lower(),
+        "scene": (asset.scene or "").lower(),
+        "caption": (asset.caption or "").lower(),
+        "keywords": " ".join(asset.keywords or []).lower(),
+        "filename": (asset.filename or "").lower(),
+    }
+    score = 0.0
+    for term in terms:
+        for field, value in fields.items():
+            if not value:
+                continue
+            if term in value:
+                score += _SEMANTIC_WEIGHTS.get(field, 1.0)
+    return score
+
+
 @dataclass
 class Asset:
     """一条采集到的图片素材记录。"""
@@ -61,6 +147,20 @@ class Asset:
     created_at: float
     duration_ms: int = 0
     """动画表情时长（毫秒），0 表示静态图。"""
+    emotion: str = ""
+    """视觉模型标注的主要情绪。"""
+    scene: str = ""
+    """视觉模型标注的使用场景。"""
+    caption: str = ""
+    """视觉模型生成的一句话描述。"""
+    keywords: list[str] = None  # type: ignore[assignment]
+    """视觉模型提取的关键词。"""
+    analyzed: bool = False
+    """是否已经做过视觉分析。"""
+
+    def __post_init__(self) -> None:
+        if self.keywords is None:
+            self.keywords = []
 
     @property
     def is_animated(self) -> bool:
@@ -83,6 +183,11 @@ class Asset:
             "created_at": self.created_at,
             "duration_ms": self.duration_ms,
             "is_animated": self.is_animated,
+            "emotion": self.emotion,
+            "scene": self.scene,
+            "caption": self.caption,
+            "keywords": self.keywords,
+            "analyzed": self.analyzed,
         }
 
 
@@ -94,6 +199,8 @@ class Query:
     sender_id: str = ""
     source: str = ""
     group_id: str = ""
+    emotion: str = ""
+    """按 AI 标注的情绪过滤。"""
     animated_only: bool = False
     static_only: bool = False
     order: str = "new"  # new | old | big | small
@@ -161,7 +268,12 @@ class Storage:
                 group_id TEXT NOT NULL DEFAULT '',
                 session_id TEXT NOT NULL DEFAULT '',
                 created_at REAL NOT NULL,
-                duration_ms INTEGER NOT NULL DEFAULT 0
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                emotion TEXT NOT NULL DEFAULT '',
+                scene TEXT NOT NULL DEFAULT '',
+                caption TEXT NOT NULL DEFAULT '',
+                keywords TEXT NOT NULL DEFAULT '',
+                analyzed INTEGER NOT NULL DEFAULT 0
             )
             """
         )
@@ -175,11 +287,38 @@ class Storage:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_assets_sha ON assets(sha256)"
         )
         self._conn.commit()
+        # 旧库可能没有视觉标注相关的列，先补列再建索引
+        self._migrate_schema()
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assets_analyzed ON assets(analyzed)"
+        )
+        self._conn.commit()
 
     def close(self) -> None:
         if self._conn is not None:
             self._conn.close()
             self._conn = None
+
+    def _migrate_schema(self) -> None:
+        """给旧版本数据库补上新增的列（老库没有视觉标注字段）。"""
+        assert self._conn is not None
+        existing = {
+            str(row["name"]) for row in self._conn.execute("PRAGMA table_info(assets)")
+        }
+        additions = {
+            "emotion": "TEXT NOT NULL DEFAULT ''",
+            "scene": "TEXT NOT NULL DEFAULT ''",
+            "caption": "TEXT NOT NULL DEFAULT ''",
+            "keywords": "TEXT NOT NULL DEFAULT ''",
+            "analyzed": "INTEGER NOT NULL DEFAULT 0",
+        }
+        changed = False
+        for column, ddl in additions.items():
+            if column not in existing:
+                self._conn.execute(f"ALTER TABLE assets ADD COLUMN {column} {ddl}")
+                changed = True
+        if changed:
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # 写入
@@ -232,7 +371,7 @@ class Storage:
         return ".bin"
 
     @staticmethod
-    def _read_image_size(data: bytes) -> tuple[int, int]:
+    def read_image_size(data: bytes) -> tuple[int, int]:
         """不依赖 Pillow 读取图片尺寸，失败时返回 (0, 0)。
 
         支持 PNG / GIF / JPEG / BMP / WEBP(VP8X/VP8/VP8L)。
@@ -288,7 +427,7 @@ class Storage:
         if not mime.startswith("image/"):
             return None
         suffix = self._suffix_of(filename, mime)
-        width, height = self._read_image_size(data)
+        width, height = self.read_image_size(data)
 
         async with self.lock:
             assert self._conn is not None
@@ -343,6 +482,15 @@ class Storage:
     # ------------------------------------------------------------------
     @staticmethod
     def _row_to_asset(row: sqlite3.Row) -> Asset:
+        raw_keywords = str(row["keywords"] or "") if "keywords" in row.keys() else ""
+        keywords: list[str] = []
+        if raw_keywords:
+            try:
+                loaded = json.loads(raw_keywords)
+                if isinstance(loaded, list):
+                    keywords = [str(item) for item in loaded]
+            except json.JSONDecodeError:
+                keywords = [part for part in raw_keywords.split(",") if part]
         return Asset(
             id=int(row["id"]),
             sha256=str(row["sha256"]),
@@ -359,6 +507,11 @@ class Storage:
             session_id=str(row["session_id"]),
             created_at=float(row["created_at"]),
             duration_ms=int(row["duration_ms"]),
+            emotion=str(row["emotion"] or "") if "emotion" in row.keys() else "",
+            scene=str(row["scene"] or "") if "scene" in row.keys() else "",
+            caption=str(row["caption"] or "") if "caption" in row.keys() else "",
+            keywords=keywords,
+            analyzed=bool(row["analyzed"]) if "analyzed" in row.keys() else False,
         )
 
     def _build_where(self, query: Query) -> tuple[str, list[Any]]:
@@ -379,6 +532,9 @@ class Storage:
         if query.group_id:
             clauses.append("group_id = ?")
             params.append(query.group_id)
+        if query.emotion:
+            clauses.append("LOWER(emotion) = LOWER(?)")
+            params.append(query.emotion)
         if query.animated_only:
             clauses.append("duration_ms > 0")
         if query.static_only:
@@ -549,6 +705,138 @@ class Storage:
         if not self.media_dir.exists():
             return []
         return list(self.media_dir.rglob("*"))
+
+    # ------------------------------------------------------------------
+    # 视觉语义
+    # ------------------------------------------------------------------
+    def pending_analysis(self, limit: int = 20) -> list[Asset]:
+        """取还没做过视觉分析的素材（按入库顺序，先到先分析）。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            "SELECT * FROM assets WHERE analyzed = 0 ORDER BY id ASC LIMIT ?",
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [self._row_to_asset(row) for row in rows]
+
+    def pending_analysis_count(self) -> int:
+        assert self._conn is not None
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM assets WHERE analyzed = 0"
+        ).fetchone()
+        return int(row["c"] or 0)
+
+    async def set_vision_tag(
+        self,
+        asset_id: int,
+        *,
+        emotion: str = "",
+        scene: str = "",
+        caption: str = "",
+        keywords: list[str] | None = None,
+    ) -> bool:
+        """写入视觉标注结果。"""
+        payload = json.dumps(keywords or [], ensure_ascii=False)
+        async with self.lock:
+            assert self._conn is not None
+            cursor = self._conn.execute(
+                """
+                UPDATE assets
+                SET emotion = ?, scene = ?, caption = ?, keywords = ?, analyzed = 1
+                WHERE id = ?
+                """,
+                (emotion, scene, caption, payload, asset_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
+
+    async def mark_analysis_failed(self, asset_id: int) -> None:
+        """分析失败时先标记成已处理，避免反复重试同一张图。"""
+        async with self.lock:
+            assert self._conn is not None
+            self._conn.execute(
+                "UPDATE assets SET analyzed = 1 WHERE id = ?", (asset_id,)
+            )
+            self._conn.commit()
+
+    def search_by_semantics(
+        self,
+        text: str,
+        limit: int = 10,
+        *,
+        only_analyzed: bool = True,
+    ) -> list[Asset]:
+        """按情绪 / 场景 / 描述 / 关键词做语义检索。
+
+        用简单的加权 LIKE 打分：关键词命中得越多、命中字段越具体，排得越前。
+        """
+        assert self._conn is not None
+        terms = [part for part in _split_terms(text) if part]
+        if not terms:
+            return []
+
+        sql = "SELECT * FROM assets"
+        params: list[Any] = []
+        if only_analyzed:
+            sql += " WHERE analyzed = 1"
+        rows = self._conn.execute(sql, params).fetchall()
+
+        scored: list[tuple[float, Asset]] = []
+        for row in rows:
+            asset = self._row_to_asset(row)
+            # QQ 系统表情（20~24 像素）没有语义价值，排除
+            if asset.emotion == "system":
+                continue
+            score = _semantic_score(asset, terms)
+            if score > 0:
+                scored.append((score, asset))
+
+        scored.sort(key=lambda item: (-item[0], -item[1].id))
+        return [asset for _, asset in scored[: max(1, int(limit))]]
+
+    def list_by_emotion(self, emotion: str, limit: int = 20) -> list[Asset]:
+        """按情绪标签取素材（精确匹配，忽略大小写）。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """
+            SELECT * FROM assets
+            WHERE analyzed = 1 AND LOWER(emotion) = LOWER(?)
+            ORDER BY RANDOM()
+            LIMIT ?
+            """,
+            (emotion, max(1, int(limit))),
+        ).fetchall()
+        return [self._row_to_asset(row) for row in rows]
+
+    def list_assets_all_analyzed(self, limit: int = 8) -> list[Asset]:
+        """取一批已分析过的素材（随机），用作语义检索失败时的兜底候选。
+
+        QQ 系统表情没有语义价值，排除在外。
+        """
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """
+            SELECT * FROM assets
+            WHERE analyzed = 1 AND emotion != 'system'
+            ORDER BY RANDOM()
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        return [self._row_to_asset(row) for row in rows]
+
+    def emotion_summary(self) -> list[dict[str, Any]]:
+        """情绪分布统计。"""
+        assert self._conn is not None
+        rows = self._conn.execute(
+            """
+            SELECT emotion, COUNT(*) AS c FROM assets
+            WHERE analyzed = 1 AND emotion != ''
+            GROUP BY emotion ORDER BY c DESC
+            """
+        ).fetchall()
+        return [
+            {"emotion": str(row["emotion"]), "count": int(row["c"])} for row in rows
+        ]
 
 
 def write_manifest(storage: Storage, path: Path) -> None:

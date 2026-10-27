@@ -32,6 +32,7 @@ const state = {
   source: "",
   order: "new",
   sender: "",
+  emotion: "",
   animated: false,
   staticOnly: false,
   lbIndex: -1,
@@ -53,6 +54,7 @@ const el = {
   source: $("source"),
   order: $("order"),
   sender: $("sender"),
+  emotion: $("emotion"),
   animated: $("animated"),
   static: $("static"),
   lightbox: $("lightbox"),
@@ -179,6 +181,17 @@ function renderGrid(items) {
     .map((item, index) => {
       const url = assetUrl(item);
       const sizeText = item.width && item.height ? `${item.width}×${item.height}` : formatBytes(item.size);
+      // 视觉模型标注出的情绪 / 场景
+      const tags = [];
+      if (item.emotion && item.emotion !== "system") {
+        tags.push(`<span class="tag-emotion">${escapeHtml(item.emotion)}</span>`);
+      }
+      if (item.scene) {
+        tags.push(`<span class="tag-scene">${escapeHtml(item.scene)}</span>`);
+      }
+      const caption = item.caption
+        ? `<div class="card-caption" title="${escapeHtml(item.caption)}">${escapeHtml(item.caption)}</div>`
+        : "";
       return `
         <div class="card" data-index="${index}">
           <div class="thumb">
@@ -186,10 +199,12 @@ function renderGrid(items) {
           </div>
           <div class="card-info">
             <div class="card-name" title="${escapeHtml(item.filename)}">${escapeHtml(item.filename)}</div>
+            ${caption}
             <div class="card-sub">
               <span class="badge ${escapeHtml(item.source)}">${escapeHtml(sourceLabel(item.source))}</span>
               <span>${escapeHtml(sizeText)}</span>
             </div>
+            ${tags.length ? `<div class="card-tags">${tags.join("")}</div>` : ""}
           </div>
           <button class="del-btn" data-del="${item.id}" title="删除">✕</button>
         </div>`;
@@ -216,6 +231,7 @@ function currentParams() {
     source: state.source,
     order: state.order,
     sender_id: state.sender,
+    emotion: state.emotion,
     animated: state.animated ? "1" : "",
     static: state.staticOnly ? "1" : "",
   };
@@ -272,6 +288,27 @@ async function loadSenders() {
   }
 }
 
+async function loadEmotions() {
+  try {
+    const data = await apiGet(`${API}/emotions`);
+    const payload = (data && data.data) || {};
+    const emotions = payload.emotions || [];
+    const current = el.emotion.value;
+    el.emotion.innerHTML =
+      '<option value="">全部情绪</option>' +
+      emotions
+        .map(
+          (item) =>
+            `<option value="${escapeHtml(item.emotion)}">` +
+            `${escapeHtml(item.emotion)} (${item.count})</option>`,
+        )
+        .join("");
+    el.emotion.value = current;
+  } catch (error) {
+    console.error("加载情绪标签失败", error);
+  }
+}
+
 /* ------------------------------------------------------------------ */
 /* 交互                                                                */
 /* ------------------------------------------------------------------ */
@@ -280,12 +317,25 @@ function openLightbox(index) {
   if (!item) return;
   state.lbIndex = index;
   el.lbImg.src = assetUrl(item);
+  const aiTags = [];
+  if (item.emotion) {
+    aiTags.push(`情绪：${item.emotion}`);
+  }
+  if (item.scene) {
+    aiTags.push(`场景：${item.scene}`);
+  }
+  if (item.keywords && item.keywords.length) {
+    aiTags.push(`关键词：${item.keywords.join("、")}`);
+  }
   el.lbMeta.innerHTML =
     `<div><strong>${escapeHtml(item.filename)}</strong></div>` +
     `<div>${escapeHtml(sourceLabel(item.source))} · ` +
     `${item.width && item.height ? escapeHtml(item.width + "×" + item.height) + " · " : ""}` +
     `${escapeHtml(formatBytes(item.size))} · ${escapeHtml(formatTime(item.created_at))}</div>` +
-    `<div>发送者：${escapeHtml(item.sender_name || "未知")} (${escapeHtml(item.sender_id)})</div>`;
+    `<div>发送者：${escapeHtml(item.sender_name || "未知")} (${escapeHtml(item.sender_id)})</div>` +
+    (aiTags.length
+      ? `<div class="lb-ai">${escapeHtml(aiTags.join(" · "))}</div>`
+      : "");
   el.lightbox.hidden = false;
 }
 
@@ -353,6 +403,7 @@ function bindEvents() {
   el.source.addEventListener("change", doSearch);
   el.order.addEventListener("change", doSearch);
   el.sender.addEventListener("change", doSearch);
+  el.emotion.addEventListener("change", doSearch);
   el.animated.addEventListener("change", doSearch);
   el.static.addEventListener("change", doSearch);
 
@@ -398,6 +449,7 @@ function doSearch() {
   state.source = el.source.value;
   state.order = el.order.value;
   state.sender = el.sender.value;
+  state.emotion = el.emotion.value;
   state.animated = el.animated.checked;
   state.staticOnly = el.static.checked;
   state.page = 1;
@@ -419,6 +471,7 @@ async function boot() {
   }
   await loadStats();
   await loadSenders();
+  await loadEmotions();
   await loadAssets();
 }
 

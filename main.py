@@ -29,6 +29,7 @@ from astrbot.api.star import Context, Star
 from astrbot.api.web import request
 
 try:  # 作为插件包加载
+    from .ai import EmojiPicker, LLMClient, PickResult
     from .pluginlogic import (
         DEFAULT_ENABLED,
         FACE_URL_TEMPLATE,
@@ -48,6 +49,7 @@ try:  # 作为插件包加载
     )
     from .storage import Asset, Query, Storage, write_manifest
 except ImportError:  # 独立运行单元测试时
+    from ai import EmojiPicker, LLMClient, PickResult
     from pluginlogic import (
         DEFAULT_ENABLED,
         FACE_URL_TEMPLATE,
@@ -88,10 +90,14 @@ class EmojiHarvesterPlugin(Star):
         super().__init__(context)
         self.config = config
         self.storage = Storage(_plugin_data_dir())
+        self.picker = EmojiPicker(self.storage, self._make_llm_client)
         self._collect_lock = asyncio.Lock()
         self._registered = False
         self._self_uin = ""
         """机器人自己的 QQ 号，用来拼 QQ 表情包的图片地址。"""
+        self._analysis_task: asyncio.Task | None = None
+        self._auto_send_history: list[float] = []
+        """最近自动发送表情包的时间戳，用于限流。"""
 
     # ------------------------------------------------------------------
     # 生命周期
@@ -155,15 +161,75 @@ class EmojiHarvesterPlugin(Star):
                 methods=["GET"],
                 desc="获取插件当前配置（脱敏）",
             )
+            self.context.register_web_api(
+                route=f"/{PLUGIN_NAME}/emoji-harvester/api/analyze",
+                view_handler=self.api_analyze,
+                methods=["POST"],
+                desc="手动触发一批视觉分析",
+            )
+            self.context.register_web_api(
+                route=f"/{PLUGIN_NAME}/emoji-harvester/api/emotions",
+                view_handler=self.api_emotions,
+                methods=["GET"],
+                desc="情绪标签分布",
+            )
             self._registered = True
+
+        # LLM 工具：让主对话模型自己决定什么时候发表情包
+        if self.tool_send_enabled and self.ai_enabled:
+            try:
+                from astrbot.api import llm_tool
+
+                llm_tool(name="send_emoji")(self.send_emoji_tool)
+                logger.info(f"[{PLUGIN_NAME}] 已注册 LLM 工具 send_emoji")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"[{PLUGIN_NAME}] 注册 LLM 工具失败: {exc!s}")
+
+        # 后台视觉分析任务
+        if self.ai_enabled:
+            self._start_analysis_task()
+
         logger.info(
-            f"[{PLUGIN_NAME}] 初始化完成，监听 QQ: {self.target_qq_list}",
+            f"[{PLUGIN_NAME}] 初始化完成，监听 QQ: {self.target_qq_list}"
+            f"，AI 模式: {self.ai_enabled}",
         )
 
     async def terminate(self) -> None:
-        """插件卸载：关闭数据库连接。"""
+        """插件卸载：关闭数据库连接、停止后台任务。"""
+        task = getattr(self, "_analysis_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
         self.storage.close()
         logger.info(f"[{PLUGIN_NAME}] 已卸载")
+
+    def _start_analysis_task(self) -> None:
+        """启动后台视觉分析任务。"""
+        task = getattr(self, "_analysis_task", None)
+        if task is not None and not task.done():
+            return
+        self._analysis_task = asyncio.create_task(self._analysis_loop())
+        logger.info(f"[{PLUGIN_NAME}] 视觉分析任务已启动")
+
+    async def _analysis_loop(self) -> None:
+        """后台循环：定期分析待处理的素材。"""
+        # 先等一会儿再开始，避免和插件初始化抢资源
+        await asyncio.sleep(5)
+        while True:
+            try:
+                count = await self.picker.analyze_pending(self.vision_batch_size)
+                if count:
+                    logger.info(f"[{PLUGIN_NAME}] 完成 {count} 张素材的视觉分析")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"[{PLUGIN_NAME}] 视觉分析出错: {exc!s}")
+            await asyncio.sleep(self.vision_interval)
 
     # ------------------------------------------------------------------
     # 配置读取
@@ -209,6 +275,123 @@ class EmojiHarvesterPlugin(Star):
     def download_timeout(self) -> int:
         return clamp_int(self._cfg("download_timeout", 15), 15, 3, 120)
 
+    # ------------------------------------------------------------------
+    # AI 相关配置
+    # ------------------------------------------------------------------
+    @property
+    def ai_enabled(self) -> bool:
+        """是否启用 AI 能力（视觉分析 + 自动发表情包）。"""
+        return bool(self._cfg("ai_enabled", False))
+
+    @property
+    def auto_send_enabled(self) -> bool:
+        """自动模式：由插件自己判断要不要发表情包。"""
+        return bool(self._cfg("auto_send_enabled", False))
+
+    @property
+    def tool_send_enabled(self) -> bool:
+        """工具模式：把 send_emoji 工具交给主对话模型，让它自己调用。"""
+        return bool(self._cfg("tool_send_enabled", True))
+
+    @property
+    def vision_api_base(self) -> str:
+        return str(self._cfg("vision_api_base", "") or "").strip().rstrip("/")
+
+    @property
+    def vision_api_key(self) -> str:
+        return str(self._cfg("vision_api_key", "") or "").strip()
+
+    @property
+    def vision_model(self) -> str:
+        return str(self._cfg("vision_model", "") or "").strip()
+
+    @property
+    def provider_source_id(self) -> str:
+        """复用 AstrBot 已有的 provider source（留空则用插件自己的配置）。"""
+        return str(self._cfg("provider_source_id", "") or "").strip()
+
+    @property
+    def vision_batch_size(self) -> int:
+        return clamp_int(self._cfg("vision_batch_size", 5), 5, 1, 20)
+
+    @property
+    def vision_interval(self) -> int:
+        """后台分析任务的轮询间隔（秒）。"""
+        return clamp_int(self._cfg("vision_interval", 60), 60, 15, 3600)
+
+    @property
+    def auto_send_cooldown(self) -> int:
+        """自动发表情包的冷却时间（秒），防止刷屏。"""
+        return clamp_int(self._cfg("auto_send_cooldown", 30), 30, 0, 3600)
+
+    @property
+    def auto_send_max_per_hour(self) -> int:
+        """每小时最多自动发送多少张表情包。"""
+        return clamp_int(self._cfg("auto_send_max_per_hour", 10), 10, 0, 200)
+
+    def _resolve_api_credentials(self) -> tuple[str, str]:
+        """解析出 (api_base, api_key)。
+
+        优先用插件自己的配置；没配 ``vision_api_key`` 时，
+        尝试复用 AstrBot 主配置里指定的 provider source
+        （插件自己的 config 里没有 provider_sources，
+        必须从 ``context.get_config()`` 拿主配置）。
+        """
+        if self.vision_api_base and self.vision_api_key:
+            return self.vision_api_base, self.vision_api_key
+
+        source_id = self.provider_source_id
+        if not source_id:
+            return "", ""
+
+        sources = self._get_main_config_sources()
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            if str(source.get("id")) != source_id:
+                continue
+            api_base = str(source.get("api_base") or "").strip().rstrip("/")
+            api_key = ""
+            keys = source.get("key") or []
+            if isinstance(keys, str):
+                keys = [keys]
+            for item in keys:
+                if isinstance(item, str) and item:
+                    api_key = item
+                    break
+                if isinstance(item, dict):
+                    candidate = item.get("key") or item.get("api_key")
+                    if candidate:
+                        api_key = str(candidate)
+                        break
+            if api_base and api_key:
+                return api_base, api_key
+        return "", ""
+
+    def _get_main_config_sources(self) -> list[Any]:
+        """从 AstrBot 主配置里取 provider_sources 列表。"""
+        try:
+            main_config = self.context.get_config()
+        except Exception:  # noqa: BLE001
+            return []
+        try:
+            sources = main_config.get("provider_sources") or []
+        except Exception:  # noqa: BLE001
+            return []
+        return sources if isinstance(sources, list) else []
+
+    def _make_llm_client(self) -> LLMClient | None:
+        """构造 LLM 客户端；没配置好就返回 None。"""
+        api_base, api_key = self._resolve_api_credentials()
+        if not api_base or not api_key or not self.vision_model:
+            return None
+        return LLMClient(
+            api_base=api_base,
+            api_key=api_key,
+            model=self.vision_model,
+            timeout=clamp_int(self._cfg("vision_timeout", 60), 60, 10, 300),
+        )
+
     def is_target(self, sender_id: str) -> bool:
         """判断发送者是否在锁定名单里。"""
         return is_target_sender(sender_id, self.target_qq_list)
@@ -218,7 +401,20 @@ class EmojiHarvesterPlugin(Star):
     # ------------------------------------------------------------------
     @filter.event_message_type(filter.EventMessageType.ALL, alias="emoji_harvester_collect")
     async def on_message(self, event: AstrMessageEvent) -> None:
-        """监听所有消息，采集被锁定用户发出的图片 / 表情包。"""
+        """监听所有消息：采集被锁定用户发的图片，并在自动模式下发表情包。"""
+        # 1) 先记录机器人自己的 QQ 号（拼表情包图片地址要用）
+        self_uin = str(getattr(event.message_obj, "self_id", "") or "").strip()
+        if self_uin.isdigit():
+            self._self_uin = self_uin
+
+        # 2) 自动发表情包（与采集互不影响）
+        if self.ai_enabled and self.auto_send_enabled:
+            try:
+                await self._auto_send_emoji(event)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"[{PLUGIN_NAME}] 自动发表情包出错: {exc!s}")
+
+        # 3) 采集
         if not self.collect_enabled:
             return
         targets = self.target_qq_list
@@ -228,13 +424,6 @@ class EmojiHarvesterPlugin(Star):
         sender_id = event.get_sender_id()
         if not self.is_target(sender_id):
             return
-
-        # 记录机器人自己的 QQ 号（拼表情包图片地址要用）
-        self_uin = str(getattr(event.message_obj, "self_id", "") or "").strip()
-        if self_uin and not self_uin.isdigit():
-            self_uin = ""
-        if self_uin:
-            self._self_uin = self_uin
 
         if self.only_in_group and not event.get_group_id():
             return
@@ -480,6 +669,113 @@ class EmojiHarvesterPlugin(Star):
         return None
 
     # ------------------------------------------------------------------
+    # AI：发表情包
+    # ------------------------------------------------------------------
+    def _build_context(self, event: AstrMessageEvent) -> str:
+        """把当前消息拼成给 AI 的情境描述。"""
+        try:
+            text = event.get_message_str().strip()
+        except Exception:  # noqa: BLE001
+            text = ""
+        if not text:
+            try:
+                text = event.get_message_outline()
+            except Exception:  # noqa: BLE001
+                text = ""
+        sender = event.get_sender_name() or event.get_sender_id()
+        return f"群成员「{sender}」说：{text}"
+
+    def _can_auto_send(self) -> bool:
+        """自动发送的限流检查。"""
+        now = time.time()
+        history = [stamp for stamp in self._auto_send_history if now - stamp < 3600]
+        self._auto_send_history = history
+        limit = self.auto_send_max_per_hour
+        if limit and len(history) >= limit:
+            return False
+        cooldown = self.auto_send_cooldown
+        if cooldown and history and now - max(history) < cooldown:
+            return False
+        return True
+
+    def _record_auto_send(self) -> None:
+        self._auto_send_history.append(time.time())
+
+    async def _send_asset_image(self, event: AstrMessageEvent, asset: Asset) -> bool:
+        """把素材作为图片消息发出去。"""
+        try:
+            path = self.storage.media_path(asset.stored_name)
+        except ValueError:
+            return False
+        if not path.is_file():
+            return False
+
+        from astrbot.core.message.components import Image
+
+        try:
+            await event.send(Image.fromFileSystem(str(path)))
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[{PLUGIN_NAME}] 发送表情包失败: {exc!s}")
+            return False
+        return True
+
+    async def send_emoji_tool(
+        self,
+        event: AstrMessageEvent,
+        emotion: str = "",
+        context: str = "",
+    ):
+        """从表情包图库里挑一张最贴合当前情绪的图片发出来。
+
+        Args:
+            emotion(string): 想要表达的情绪，例如 happy / laugh / surprise / sad / angry / love / cry / 尴尬 / 无语
+            context(string): 当前聊天情境的简短描述，例如「用户分享了好消息」
+        """
+        if not self.ai_enabled:
+            return "AI 模式未启用，无法发表情包。"
+
+        query = " ".join(part for part in (emotion, context) if part).strip()
+        if not query:
+            query = self._build_context(event)
+
+        result = await self.picker.pick(query)
+        if result.asset is None:
+            return f"没有找到合适的表情包（{result.reason}）。"
+
+        sent = await self._send_asset_image(event, result.asset)
+        if not sent:
+            return "表情包文件缺失，发送失败。"
+
+        suffix = f"（{result.reason}）" if result.reason else ""
+        return f"已发送表情包 #{result.asset.id} {result.asset.filename}{suffix}"
+
+    async def _auto_send_emoji(self, event: AstrMessageEvent) -> bool:
+        """自动模式：判断该不该发表情包，是则发一张。"""
+        if not (self.ai_enabled and self.auto_send_enabled):
+            return False
+        if not self._can_auto_send():
+            return False
+
+        context = self._build_context(event)
+        try:
+            result = await self.picker.decide(context)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[{PLUGIN_NAME}] 自动发表情包判断失败: {exc!s}")
+            return False
+
+        if not result.should_send or result.asset is None:
+            logger.debug(f"[{PLUGIN_NAME}] 不自动发表情包：{result.reason}")
+            return False
+
+        sent = await self._send_asset_image(event, result.asset)
+        if sent:
+            self._record_auto_send()
+            logger.info(
+                f"[{PLUGIN_NAME}] 自动发送表情包 #{result.asset.id}（{result.reason}）",
+            )
+        return sent
+
+    # ------------------------------------------------------------------
     # 指令
     # ------------------------------------------------------------------
     @filter.command("图库")
@@ -525,6 +821,44 @@ class EmojiHarvesterPlugin(Star):
             lines.append("最近收录：")
             for item in recent.items:
                 lines.append(f"• #{item.id} {item.filename}")
+        await event.send("\n".join(lines))
+
+    @filter.command("发表情包")
+    async def cmd_send_emoji(self, event: AstrMessageEvent, *args: str) -> None:
+        """手动让 AI 挑一张表情包发出来。
+
+        用法：
+        - ``/发表情包`` 让 AI 根据当前消息挑一张
+        - ``/发表情包 开心 分享了好消息`` 指定情绪和情境
+        """
+        if not self.ai_enabled:
+            await event.send("❌ AI 模式未启用。")
+            return
+        emotion = args[0] if args else ""
+        context = " ".join(args[1:]) if len(args) > 1 else ""
+        result = await self.send_emoji_tool(event, emotion, context)
+        await event.send(str(result))
+
+    @filter.command("图库状态")
+    async def cmd_gallery_status(self, event: AstrMessageEvent) -> None:
+        """查看图库与 AI 标注状态。"""
+        stats = self.storage.stats()
+        pending = self.storage.pending_analysis_count()
+        lines = [
+            "🖼️ 表情包图库",
+            f"• 素材总数：{stats['count']} 张",
+            f"• 占用空间：{stats['total_bytes'] / 1024 / 1024:.1f} MB",
+            f"• AI 模式：{'开启' if self.ai_enabled else '关闭'}",
+            f"• 自动发表情包：{'开启' if self.auto_send_enabled else '关闭'}",
+            f"• 待分析：{pending} 张",
+        ]
+        if self.ai_enabled:
+            emotions = self.storage.emotion_summary()
+            if emotions:
+                top = "、".join(
+                    f"{item['emotion']}({item['count']})" for item in emotions[:6]
+                )
+                lines.append(f"• 情绪分布：{top}")
         await event.send("\n".join(lines))
 
     @filter.command("添加图库目标")
@@ -599,6 +933,7 @@ class EmojiHarvesterPlugin(Star):
             sender_id=str(params.get("sender_id", "") or "").strip(),
             source=str(params.get("source", "") or "").strip(),
             group_id=str(params.get("group_id", "") or "").strip(),
+            emotion=str(params.get("emotion", "") or "").strip(),
             animated_only=str(params.get("animated", "")).lower() in ("1", "true", "yes"),
             static_only=str(params.get("static", "")).lower() in ("1", "true", "yes"),
             order=str(params.get("order", "new") or "new"),
@@ -709,5 +1044,40 @@ class EmojiHarvesterPlugin(Star):
                 "max_file_mb": self.max_file_mb,
                 "notify_on_collect": self.notify_on_collect,
                 "plugin_version": PLUGIN_VERSION,
+                "ai_enabled": self.ai_enabled,
+                "auto_send_enabled": self.auto_send_enabled,
+                "tool_send_enabled": self.tool_send_enabled,
+                "vision_model": self.vision_model,
+                "has_api_key": bool(self._resolve_api_credentials()[1]),
+                "pending_analysis": self.storage.pending_analysis_count(),
+            },
+        }
+
+    async def api_analyze(self) -> dict[str, Any]:
+        """POST /emoji-harvester/api/analyze —— 手动触发一批视觉分析。"""
+        if not self.ai_enabled:
+            return {
+                "status": "error",
+                "message": "AI 模式未启用",
+                "data": {},
+            }
+        count = await self.picker.analyze_pending(self.vision_batch_size)
+        return {
+            "status": "ok",
+            "message": f"已分析 {count} 张素材",
+            "data": {
+                "analyzed": count,
+                "pending": self.storage.pending_analysis_count(),
+            },
+        }
+
+    async def api_emotions(self) -> dict[str, Any]:
+        """GET /emoji-harvester/api/emotions —— 情绪标签分布。"""
+        return {
+            "status": "ok",
+            "message": "",
+            "data": {
+                "emotions": self.storage.emotion_summary(),
+                "pending": self.storage.pending_analysis_count(),
             },
         }

@@ -38,5 +38,65 @@
     "description": "下载表情图片的超时时间（秒）",
     "type": "int",
     "default": 15
+  },
+  "ai_enabled": {
+    "description": "启用 AI 能力（视觉分析 + 智能发表情包）",
+    "type": "bool",
+    "default": false
+  },
+  "auto_send_enabled": {
+    "description": "自动模式：AI 根据聊天内容自己判断要不要发表情包",
+    "type": "bool",
+    "default": false
+  },
+  "tool_send_enabled": {
+    "description": "工具模式：把 send_emoji 工具交给对话模型，让它自己决定发表情包",
+    "type": "bool",
+    "default": true
+  },
+  "vision_model": {
+    "description": "视觉模型名（需要支持看图），例如 buddy/glm-5v-turbo",
+    "type": "string",
+    "default": ""
+  },
+  "vision_api_base": {
+    "description": "视觉模型的 API 地址（OpenAI 兼容）。留空则复用下面的 provider source",
+    "type": "string",
+    "default": ""
+  },
+  "vision_api_key": {
+    "description": "视觉模型的 API Key。留空则复用下面的 provider source",
+    "type": "string",
+    "default": ""
+  },
+  "provider_source_id": {
+    "description": "复用 AstrBot 里已配置的 provider source id（会沿用它的 api_base 和 key）",
+    "type": "string",
+    "default": ""
+  },
+  "vision_batch_size": {
+    "description": "每轮视觉分析处理的图片数量",
+    "type": "int",
+    "default": 5
+  },
+  "vision_interval": {
+    "description": "后台视觉分析的轮询间隔（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "vision_timeout": {
+    "description": "调用视觉模型的超时时间（秒）",
+    "type": "int",
+    "default": 60
+  },
+  "auto_send_cooldown": {
+    "description": "自动发表情包的冷却时间（秒），0 表示不限",
+    "type": "int",
+    "default": 30
+  },
+  "auto_send_max_per_hour": {
+    "description": "每小时最多自动发送多少张表情包，0 表示不限",
+    "type": "int",
+    "default": 10
   }
 }
